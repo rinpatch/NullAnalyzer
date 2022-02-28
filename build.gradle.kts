@@ -1,5 +1,4 @@
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
-import org.jetbrains.kotlin.ir.backend.js.compile
 
 plugins {
     kotlin("jvm") version "1.6.10"
@@ -18,10 +17,7 @@ dependencies {
     testImplementation(kotlin("test"))
     implementation("com.github.javaparser:javaparser-core:3.24.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.3.2")
-    // TODO: For testing, remove before submitting
-    implementation("com.github.javaparser:javaparser-core-serialization:3.24.0")
-    implementation("javax.json:javax.json-api:1.1.4")
-    implementation("org.glassfish:javax.json:1.1.4")
+    implementation(kotlin("stdlib-jdk8"))
 }
 
 tasks.test {
@@ -44,4 +40,12 @@ tasks.jar {
 
 application {
     mainClass.set("MainKt")
+}
+val compileKotlin: KotlinCompile by tasks
+compileKotlin.kotlinOptions {
+    jvmTarget = "1.8"
+}
+val compileTestKotlin: KotlinCompile by tasks
+compileTestKotlin.kotlinOptions {
+    jvmTarget = "1.8"
 }

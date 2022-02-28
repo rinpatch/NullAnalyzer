@@ -6,14 +6,17 @@ import com.github.javaparser.ast.expr.*
 import com.github.javaparser.ast.stmt.BlockStmt
 import com.github.javaparser.ast.stmt.ExpressionStmt
 import com.github.javaparser.ast.stmt.IfStmt
+import com.github.javaparser.ast.stmt.SwitchStmt
+import kotlinx.serialization.Serializable
 import java.io.File
 
 private typealias AnalyzeIR = Pair<List<Analyzer.Error>, Map<String, Analyzer.Assumption>>
 private typealias MethodMap = Map<String, List<Pair<String, Analyzer.Assumption>>>
 
 object Analyzer {
+    @Serializable(with = ErrorSerializer::class)
     data class Error(val type: Type, val causedBy: Node, val proof: Assumption) {
-        enum class Type { REDUNDANT_NULL_CHECK, REDUNDANT_NOT_NULL_CHECK, FIELD_ACCESS_MAY_BE_NULL, FIELD_ACCESS_IS_NULL, FUNCTION_CALL_MAY_BE_NULL, FUNCTION_CALL_IS_NULL }
+        enum class Type { REDUNDANT_NULL_CHECK, REDUNDANT_NOT_NULL_CHECK, FIELD_ACCESS_MAY_BE_NULL, FIELD_ACCESS_IS_NULL, FUNCTION_CALL_MAY_BE_NULL, FUNCTION_CALL_IS_NULL, SWITCH_ON_NULL }
     }
 
     data class Assumption(val type: Type, val causedBy: Node) {
@@ -31,12 +34,12 @@ object Analyzer {
         assumptions: Map<String, Assumption>,
         errors: List<Error>
     ): AnalyzeIR =
-        // TODO: Switch statement
         when (startNode.javaClass) {
             MethodDeclaration::class.java -> analyze(startNode as MethodDeclaration, methodMap, assumptions, errors)
             BlockStmt::class.java -> analyze(startNode as BlockStmt, methodMap, assumptions, errors)
             ExpressionStmt::class.java -> analyze(startNode as ExpressionStmt, methodMap, assumptions, errors)
             IfStmt::class.java -> analyze(startNode as IfStmt, methodMap, assumptions, errors)
+            SwitchStmt::class.java -> analyze(startNode as SwitchStmt, methodMap, assumptions, errors)
             else -> errors to assumptions
         }
 
@@ -68,95 +71,102 @@ object Analyzer {
         return newErrors to assumptions
     }
 
-    // TODO: Method map support
-    private fun analyzeInitializer(
-        expression: Expression?,
+    private fun analyzeExpression(
+        expression: Expression,
         methodMap: MethodMap,
-        assumptions: Map<String, Assumption>
-    ): Pair<Error?, Assumption.Type> {
-        if (expression != null) {
-            val unwrappedExpression = maybeUnwrapExpression(expression)
-            return when {
-                // XXX: Not correct in case of primitive types
-                unwrappedExpression.isNullLiteralExpr -> null to Assumption.Type.NULL
-                unwrappedExpression.isLiteralExpr -> null to Assumption.Type.NOT_NULL
-                unwrappedExpression.isNameExpr -> {
-                    val name = unwrappedExpression.asNameExpr().name.asString()
-                    val assumptionType = when (val type = assumptions[name]?.type) {
-                        null -> Assumption.Type.UNKNOWN
-                        else -> type
-                    }
-                    null to assumptionType
-                }
-                unwrappedExpression.isFieldAccessExpr || unwrappedExpression.isMethodCallExpr -> {
-                    val scope =
-                        if (unwrappedExpression.isFieldAccessExpr) {
-                            maybeUnwrapExpression(unwrappedExpression.asFieldAccessExpr().scope)
-                        } else {
-                            val wrappedScope = unwrappedExpression.asMethodCallExpr().scope.orElse(null)
-                                ?: return null to Assumption.Type.UNKNOWN
-                            maybeUnwrapExpression(wrappedScope)
-                        }
-                    val assumption = if (scope.isNameExpr) assumptions[scope.asNameExpr().name.asString()] else null
-                    val error = when (assumption?.type) {
-                        Assumption.Type.NULLABLE -> Error(Error.Type.FIELD_ACCESS_MAY_BE_NULL, expression, assumption)
-                        Assumption.Type.NULL -> Error(Error.Type.FIELD_ACCESS_IS_NULL, expression, assumption)
-                        else -> null
-                    }
-                    error to Assumption.Type.UNKNOWN
-                }
-                else -> null to Assumption.Type.UNKNOWN
-            }
-        } else {
-            return null to Assumption.Type.UNKNOWN
-        }
-    }
-
-    // TODO: Method map support
-    private fun analyzeAssignExpr(assignExpression: AssignExpr, methodMap: MethodMap, assumptions: Map<String, Assumption>): AnalyzeIR =
-        if (assignExpression.operator == AssignExpr.Operator.ASSIGN && assignExpression.target.isNameExpr) {
-            val name = assignExpression.target.asNameExpr().name.asString()
-            val (error, assumptionType) = analyzeInitializer(assignExpression.value, methodMap, assumptions)
-            val assumption = Assumption(assumptionType, assignExpression)
-            val errors = error?.let { listOf(error) } ?: listOf<Error>()
-            errors to (assumptions + (name to assumption))
-        } else {
-            listOf<Error>() to assumptions
-        }
-    private fun analyzeExpression(expression: Expression, methodMap: MethodMap, assumptions: Map<String, Assumption>): Pair<Assumption.Type, AnalyzeIR> {
+        assumptions: Map<String, Assumption>,
+        inversion: Boolean
+    ): Pair<Assumption, AnalyzeIR> {
         val unwrappedExpression = maybeUnwrapExpression(expression)
         val unchangedIR = listOf<Error>() to assumptions
         return when (unwrappedExpression.javaClass) {
-            AssignExpr::class.java -> analyzeExpression(expression.asAssignExpr(), methodMap, assumptions)
-            NameExpr::class.java -> analyzeExpression(expression.asNameExpr(), methodMap, assumptions)
-            FieldAccessExpr::class.java -> analyzeExpression(expression.asFieldAccessExpr(), methodMap, assumptions)
-            MethodCallExpr::class.java -> analyzeExpression(expression.asMethodCallExpr(), methodMap, assumptions)
-            NullLiteralExpr::class.java -> Assumption.Type.NULL to unchangedIR
-            LiteralExpr::class.java -> Assumption.Type.NOT_NULL to unchangedIR
-            else -> Assumption.Type.UNKNOWN to unchangedIR
+            VariableDeclarationExpr::class.java -> analyzeExpression(
+                expression.asVariableDeclarationExpr(),
+                methodMap,
+                assumptions,
+                inversion
+            )
+            AssignExpr::class.java -> analyzeExpression(expression.asAssignExpr(), methodMap, assumptions, inversion)
+            NameExpr::class.java -> analyzeExpression(expression.asNameExpr(), methodMap, assumptions, inversion)
+            FieldAccessExpr::class.java -> analyzeExpression(
+                expression.asFieldAccessExpr(),
+                methodMap,
+                assumptions,
+                inversion
+            )
+            MethodCallExpr::class.java -> analyzeExpression(
+                expression.asMethodCallExpr(),
+                methodMap,
+                assumptions,
+                inversion
+            )
+            UnaryExpr::class.java -> analyzeExpression(expression.asUnaryExpr(), methodMap, assumptions, inversion)
+            BinaryExpr::class.java -> analyzeExpression(expression.asBinaryExpr(), methodMap, assumptions, inversion)
+            NullLiteralExpr::class.java -> Assumption(Assumption.Type.NULL, unwrappedExpression) to unchangedIR
+            else -> {
+                val assumptionType =
+                    if (unwrappedExpression.isLiteralExpr) Assumption.Type.NOT_NULL
+                    else Assumption.Type.UNKNOWN
+                return Assumption(assumptionType, unwrappedExpression) to unchangedIR
+            }
         }
     }
-    private fun analyzeExpression(assignExpression: AssignExpr, methodMap: MethodMap, assumptions: Map<String, Assumption>): Pair<Assumption.Type, AnalyzeIR> =
+
+    private fun analyzeExpression(
+        declarationExpression: VariableDeclarationExpr,
+        methodMap: MethodMap,
+        assumptions: Map<String, Assumption>,
+        inversion: Boolean
+    ): Pair<Assumption, AnalyzeIR> {
+        val IR = declarationExpression.variables.fold(listOf<Error>() to assumptions) { acc, declarator ->
+            val (accErrors, accAssumptions) = acc
+            val name = declarator.name.asString()
+            val initializer = declarator.initializer.orElse(null)
+            // Adding accAssumptions should catch stuff like:
+            // TreeNode test = null, test2 = test.getChildAt(0);
+            val (assumption, IR) = analyzeExpression(initializer, methodMap, accAssumptions, inversion)
+            val (initializerErrors, newAssumptions) = IR
+            (accErrors + initializerErrors) to (newAssumptions + (name to assumption))
+        }
+        return Assumption(Assumption.Type.UNKNOWN, declarationExpression) to IR
+    }
+
+    private fun analyzeExpression(
+        assignExpression: AssignExpr,
+        methodMap: MethodMap,
+        assumptions: Map<String, Assumption>,
+        inversion: Boolean
+    ): Pair<Assumption, AnalyzeIR> =
         if (assignExpression.operator == AssignExpr.Operator.ASSIGN) {
             val name = assignExpression.target.asNameExpr().name.asString()
-            val (assumptionType, IR) = analyzeExpression(assignExpression.value, methodMap, assumptions)
+            val (assumption, IR) = analyzeExpression(assignExpression.value, methodMap, assumptions, inversion)
             val newIR =
                 if (!assignExpression.target.isNameExpr) IR
-                else IR.first to IR.second + (assignExpression.target.asNameExpr().name.asString() to Assumption(assumptionType, assignExpression))
-            assumptionType to newIR
+                else IR.first to IR.second + (name to assumption)
+            assumption to newIR
         } else {
-            Assumption.Type.UNKNOWN to (listOf<Error>() to assumptions)
+            Assumption(Assumption.Type.UNKNOWN, assignExpression) to (listOf<Error>() to assumptions)
         }
 
-    private fun analyzeExpression(nameExpression: NameExpr, methodMap: MethodMap, assumptions: Map<String, Assumption>): Pair<Assumption.Type, AnalyzeIR> {
+    @Suppress("UNUSED_PARAMETER")
+    private fun analyzeExpression(
+        nameExpression: NameExpr,
+        methodMap: MethodMap,
+        assumptions: Map<String, Assumption>,
+        inversion: Boolean
+    ): Pair<Assumption, AnalyzeIR> {
         val name = nameExpression.name.asString()
-        val assumptionType = when (val type = assumptions[name]?.type) {
-            null -> Assumption.Type.UNKNOWN
-            else -> type
-        }
-        return assumptionType to (listOf<Error>() to assumptions)
+        val assumption = assumptions[name] ?: Assumption(Assumption.Type.UNKNOWN, nameExpression)
+        return assumption to (listOf<Error>() to assumptions)
     }
-    private fun analyzeExpression(fieldAccessExpr: FieldAccessExpr, methodMap: MethodMap, assumptions: Map<String, Assumption>): Pair<Assumption.Type, AnalyzeIR> {
+
+    @Suppress("UNUSED_PARAMETER")
+    private fun analyzeExpression(
+        fieldAccessExpr: FieldAccessExpr,
+        methodMap: MethodMap,
+        assumptions: Map<String, Assumption>,
+        inversion: Boolean
+    ): Pair<Assumption, AnalyzeIR> {
         val scope = maybeUnwrapExpression(fieldAccessExpr.scope)
         val assumption = if (scope.isNameExpr) assumptions[scope.asNameExpr().name.asString()] else null
         val error = when (assumption?.type) {
@@ -164,35 +174,59 @@ object Analyzer {
             Assumption.Type.NULL -> Error(Error.Type.FIELD_ACCESS_IS_NULL, fieldAccessExpr, assumption)
             else -> null
         }
-        val errors = error?.let { listOf(error) } ?: listOf<Error>()
-        // TODO: Support fields in assumptions
-        return Assumption.Type.NULLABLE to (errors to assumptions)
+        val errors = error?.let { listOf(error) } ?: listOf()
+        // Will cause errors since we don't really support fields in assumptions
+        // return Assumption(Assumption.Type.NULLABLE, fieldAccessExpr) to (errors to assumptions)
+         return Assumption(Assumption.Type.UNKNOWN, fieldAccessExpr) to (errors to assumptions)
     }
-    private fun analyzeExpression(methodCallExpr: MethodCallExpr, methodMap: MethodMap, assumptions: Map<String, Assumption>): Pair<Assumption.Type, AnalyzeIR> {
+
+    private fun analyzeExpression(
+        methodCallExpr: MethodCallExpr,
+        methodMap: MethodMap,
+        assumptions: Map<String, Assumption>,
+        inversion: Boolean
+    ): Pair<Assumption, AnalyzeIR> {
+        val returnAssumption = Assumption(Assumption.Type.UNKNOWN, methodCallExpr)
         if (methodCallExpr.scope.isEmpty) {
             val name = methodCallExpr.name.asString()
             val methodAssumptions = methodMap[name]
             if (methodAssumptions != null && methodAssumptions.size == methodCallExpr.arguments.size) {
-                val argumentAssumptionTypes = methodCallExpr.arguments.map { analyzeExpression(it, methodMap, assumptions).first }
-                val errors = methodAssumptions.withIndex().fold (listOf<Error>()){ errors, (index, parameter) ->
-                   val (_, parameterAssumption)  = parameter
-                    if(parameterAssumption.type == Assumption.Type.NOT_NULL && argumentAssumptionTypes[index] != Assumption.Type.NOT_NULL)  {
-                        val error = when(argumentAssumptionTypes[index]) {
-                            // TODO: proper assumption proof
-                            Assumption.Type.NULL -> Error(Error.Type.FUNCTION_CALL_IS_NULL, methodCallExpr, Assumption(argumentAssumptionTypes[index], methodCallExpr))
-                            else -> Error(Error.Type.FUNCTION_CALL_MAY_BE_NULL, methodCallExpr, Assumption(argumentAssumptionTypes[index], methodCallExpr))
+                val argumentAssumptions =
+                    methodCallExpr.arguments.map { analyzeExpression(it, methodMap, assumptions, inversion).first }
+                val errors = methodAssumptions.withIndex().fold(listOf<Error>()) { errors, (index, parameter) ->
+                    val (_, parameterAssumption) = parameter
+                    if (parameterAssumption.type == Assumption.Type.NOT_NULL && argumentAssumptions[index].type != Assumption.Type.NOT_NULL) {
+                        val error = when (argumentAssumptions[index].type) {
+                            Assumption.Type.NULL -> Error(
+                                Error.Type.FUNCTION_CALL_IS_NULL,
+                                methodCallExpr,
+                                argumentAssumptions[index]
+                            )
+                            else -> Error(
+                                Error.Type.FUNCTION_CALL_MAY_BE_NULL,
+                                methodCallExpr,
+                                argumentAssumptions[index]
+                            )
                         }
                         errors + error
                     } else errors
                 }
-                return Assumption.Type.UNKNOWN to (errors to assumptions)
+                return returnAssumption to (errors to assumptions)
             }
         }
         // TODO: Field support
         else if (methodCallExpr.scope.isPresent && methodCallExpr.scope.get().isNameExpr) {
+            val assumption = assumptions[methodCallExpr.scope.get().asNameExpr().name.asString()]
+            val error = when (assumption?.type) {
+                Assumption.Type.NULL -> Error(Error.Type.FIELD_ACCESS_IS_NULL, methodCallExpr, assumption)
+                Assumption.Type.NULLABLE -> Error(Error.Type.FIELD_ACCESS_MAY_BE_NULL, methodCallExpr, assumption)
+                else -> null
+            }
+            val errors = error?.let { listOf(it) } ?: listOf()
+            return returnAssumption to (errors to assumptions)
         }
 
-        return Assumption.Type.UNKNOWN to (listOf<Error>() to assumptions)
+        return returnAssumption to (listOf<Error>() to assumptions)
     }
 
     private fun analyze(
@@ -202,26 +236,9 @@ object Analyzer {
         errors: List<Error>
     ): AnalyzeIR {
         val expression = expressionStatement.expression
-        if (expression.isVariableDeclarationExpr) {
-            val declarationExpression = expression.asVariableDeclarationExpr()
-            val (newErrors, declarationAssumptions) = declarationExpression.variables.fold(listOf<Error>() to mapOf<String, Assumption>()) { acc, declarator ->
-                val (accErrors, accAssumptions) = acc
-                val name = declarator.name.asString()
-                val initializer = declarator.initializer.orElse(null)
-                // Adding accAssumptions should catch stuff like:
-                // TreeNode test = null, test2 = test.getChildAt(0);
-                val (error, assumptionType) = analyzeInitializer(initializer, methodMap, assumptions + accAssumptions)
-                val assumption = Assumption(assumptionType, declarator)
-                val newErrors = error?.let { listOf(error) } ?: listOf<Error>()
-                (accErrors + newErrors) to (accAssumptions + (name to assumption))
-            }
-            return (errors + newErrors) to (declarationAssumptions + assumptions)
-        } else  {
-            val (_, IR) = analyzeExpression(expression, methodMap, assumptions)
-            val (newErrors, newAssumptions) = IR
-            return (errors + newErrors) to newAssumptions
-        }
-        return errors to assumptions
+        val (_, IR) = analyzeExpression(expression, methodMap, assumptions, false)
+        val (newErrors, newAssumptions) = IR
+        return (errors + newErrors) to newAssumptions
     }
 
     // IDK if it is normal for ASTs to have EnclosedExpression as a separate node, but seems really weird.
@@ -232,189 +249,117 @@ object Analyzer {
             expression
         }
 
-    private fun analyzeIfCondition(
+    private fun analyzeExpression(
         unaryExpr: UnaryExpr,
         methodMap: MethodMap,
         assumptions: Map<String, Assumption>,
         inversion: Boolean
-    ): AnalyzeIR =
+    ): Pair<Assumption, AnalyzeIR> =
         if (unaryExpr.operator == UnaryExpr.Operator.LOGICAL_COMPLEMENT) {
             val unwrappedExpr = maybeUnwrapExpression(unaryExpr.expression)
-            analyzeIfCondition(unwrappedExpr, methodMap, assumptions, !inversion)
+            analyzeExpression(unwrappedExpr, methodMap, assumptions, !inversion)
         } else {
-            listOf<Error>() to assumptions
+            Assumption(Assumption.Type.UNKNOWN, unaryExpr) to (listOf<Error>() to assumptions)
         }
 
-    // XXX: I am really not satisfied with the whole stupid when (x.javaClass) thing here and in analyze,
-    // there must be a better way to do this. But I can't think of one.
-    private fun analyzeIfCondition(
-        expression: Expression,
-        methodMap: MethodMap,
-        assumptions: Map<String, Assumption>,
-        inversion: Boolean
-    ): AnalyzeIR {
-        val unwrappedExpr = maybeUnwrapExpression(expression)
-        return when (unwrappedExpr.javaClass) {
-            BinaryExpr::class.java -> analyzeIfCondition(unwrappedExpr.asBinaryExpr(), methodMap, assumptions, inversion)
-            UnaryExpr::class.java -> analyzeIfCondition(unwrappedExpr.asUnaryExpr(), methodMap, assumptions, inversion)
-            AssignExpr::class.java -> analyzeAssignExpr(unwrappedExpr.asAssignExpr(), methodMap, assumptions)
-            else -> {
-                ///XXX: Kind of stupid to have an if in a when, but it appears I can't do something like:
-                // in listOf(MethodCallExpr::class.java, FieldAccessExpr::class.java) -> {
-                if (unwrappedExpr.isMethodCallExpr || unwrappedExpr.isFieldAccessExpr) {
-                    // XXX: Not really initalizer, but the function was already there and seems to accomplish the same goals
-                    val (error, _) = analyzeInitializer(unwrappedExpr, methodMap, assumptions)
-                    val errors = error?.let { listOf(error) } ?: listOf<Error>()
-                    errors to assumptions
-                } else {
-                    listOf<Error>() to assumptions
-                }
+    private fun maybeInvertAssumptionType(assumptionType: Assumption.Type, invert: Boolean): Assumption.Type =
+        if (invert) {
+            when (assumptionType) {
+                Assumption.Type.NULL -> Assumption.Type.NOT_NULL
+                else -> Assumption.Type.UNKNOWN
             }
-        }
-    }
-// Redundant null check: Error if any of the expressions check for null when assumption is not null. For example ((test != null && cond == false) || cond2 == true)
-// Assumption: Only assume the var is null or non-null if the condition is always checked.
-// For example (((test != null) && cond1) || ((test != null) && cond2)) should result in test assumption being NOT_NULL
+        } else assumptionType
 
-    private fun analyzeIfCondition(
+    private fun analyzeExpression(
         binaryExpr: BinaryExpr,
         methodMap: MethodMap,
         assumptions: Map<String, Assumption>,
         inversion: Boolean
-    ): AnalyzeIR {
+    ): Pair<Assumption, AnalyzeIR> {
         val left = maybeUnwrapExpression(binaryExpr.left)
         val right = maybeUnwrapExpression(binaryExpr.right)
-        when (val operator = binaryExpr.operator) {
+        return when (val operator = binaryExpr.operator) {
             in listOf(BinaryExpr.Operator.AND, BinaryExpr.Operator.OR) -> {
                 // De Morgan's laws
                 val isOr = (operator == BinaryExpr.Operator.OR).xor(inversion)
-                val (leftErrors, leftAssumptions) = analyzeIfCondition(left, methodMap, assumptions, inversion)
+                val (_, leftIR) = analyzeExpression(left, methodMap, assumptions, inversion)
+                val (leftErrors, leftAssumptions) = leftIR
                 // Pass left assumptions in case of &&, so that, for example @Nullable test would not produce
                 // an error with if(test != null && test.field == "stuff")
-                // TODO: Actually implement field checking in ifs
                 val rightInputAssumptions = if (!isOr) leftAssumptions else assumptions
-                val (rightErrors, rightAssumptions) = analyzeIfCondition(right, methodMap, rightInputAssumptions, inversion)
+                val (_, rightIR) = analyzeExpression(right, methodMap, rightInputAssumptions, inversion)
+                val (rightErrors, rightAssumptions) = rightIR
                 val mergedAssumptions =
                     if (isOr) {
                         leftAssumptions.filter { (key, value) -> rightAssumptions[key] == value }
                     } else {
                         leftAssumptions + rightAssumptions
                     }
-                return (rightErrors + leftErrors) to mergedAssumptions
+                Assumption(Assumption.Type.UNKNOWN, binaryExpr) to ((rightErrors + leftErrors) to mergedAssumptions)
             }
 
             in listOf(BinaryExpr.Operator.EQUALS, BinaryExpr.Operator.NOT_EQUALS) -> {
                 val isNotEquals = (operator == BinaryExpr.Operator.NOT_EQUALS).xor(inversion)
-                val sides = listOf(left, right).map { maybeUnwrapExpression(it) }
-                val (sideErrors, sideAssumptions) = sides.fold(listOf<Error>() to assumptions) { (errors, assumptions), side ->
-                    when {
-                        side.isNameExpr -> errors to assumptions
-                        side.isLiteralExpr -> errors to assumptions
-                        else -> {
-                            val (addErrors, addAssumptions) = analyzeIfCondition(side, methodMap, assumptions, inversion)
-                            (errors + addErrors) to (assumptions + addAssumptions)
-                        }
+                val (leftAssumption, leftIR) = analyzeExpression(left, methodMap, assumptions, inversion)
+                val (rightAssumption, rightIR) = analyzeExpression(right, methodMap, assumptions, inversion)
+                val sideErrors = leftIR.first + rightIR.first
+                val (error, assumptionEntry) = when {
+                    leftAssumption.type == Assumption.Type.NULL && rightAssumption.type == Assumption.Type.NULL -> {
+                        val errorType =
+                            if (isNotEquals) Error.Type.REDUNDANT_NOT_NULL_CHECK else Error.Type.REDUNDANT_NULL_CHECK
+                        Error(errorType, binaryExpr, leftAssumption) to null
                     }
-                }
-                val nameExpr = sides.find { it.isNameExpr }
-                if (nameExpr != null) {
-                    val name = nameExpr.asNameExpr().name.asString()
-                    val second = (sides - nameExpr).first()
-                    val (compareErrors, compareAssumptions) = when {
-                        second.isNullLiteralExpr ->
-                            when (sideAssumptions[name]?.type) {
-                                Assumption.Type.NOT_NULL -> {
-                                    val errorType = if (isNotEquals) {
-                                        Error.Type.REDUNDANT_NOT_NULL_CHECK
-                                    } else {
-                                        Error.Type.REDUNDANT_NULL_CHECK
-                                    }
-                                    listOf(
-                                        Error(
-                                            errorType,
-                                            binaryExpr,
-                                            sideAssumptions[name]!!
-                                        )
-                                    ) to mapOf<String, Assumption>()
-                                }
-
-                                in listOf(Assumption.Type.UNKNOWN, Assumption.Type.NULLABLE) -> {
-                                    val assumptionType = if (isNotEquals) {
-                                        Assumption.Type.NOT_NULL
-                                    } else {
-                                        Assumption.Type.NULL
-                                    }
-                                    listOf<Error>() to mapOf(
-                                        name to Assumption(
-                                            assumptionType,
-                                            binaryExpr
-                                        )
-                                    )
-                                }
-                                else -> {
-                                    listOf<Error>() to mapOf()
-                                }
-                            }
-                        second.isLiteralExpr ->
-                            if (!inversion) {
-                                listOf<Error>() to sideAssumptions + mapOf(
-                                    name to Assumption(
-                                        Assumption.Type.NOT_NULL,
-                                        binaryExpr
-                                    )
-                                )} else {
-                                    listOf<Error>() to mapOf<String, Assumption>()
-                                }
-                        second.isNameExpr -> {
-                            // FIXME: Does behave correctly with != and inversions. Create test cases and fix.
-                            // TODO: Think whether these !! can fail on valid code
-                            val firstAssumptionType = sideAssumptions[name]!!.type
-                            val secondName = second.asNameExpr().name.asString()
-                            val secondAssumptionType = sideAssumptions[secondName]!!.type
-                            val (error, newAssumptions) = when {
-                                firstAssumptionType in listOf(
-                                    Assumption.Type.UNKNOWN,
-                                    Assumption.Type.NULLABLE
-                                ) && secondAssumptionType != Assumption.Type.UNKNOWN && !isNotEquals ->
-                                    null to mapOf(name to Assumption(secondAssumptionType, binaryExpr))
-                                secondAssumptionType in listOf(
-                                    Assumption.Type.UNKNOWN,
-                                    Assumption.Type.NULLABLE
-                                ) && firstAssumptionType != Assumption.Type.UNKNOWN && !isNotEquals ->
-                                    null to mapOf(secondName to Assumption(firstAssumptionType, binaryExpr))
-                                firstAssumptionType == Assumption.Type.NULL && secondAssumptionType == Assumption.Type.NOT_NULL ->
-                                    // TODO: Maybe proof should include two assumptions for this case
-                                    Error(
-                                        if (isNotEquals) {
-                                            Error.Type.REDUNDANT_NOT_NULL_CHECK
-                                        } else {
-                                            Error.Type.REDUNDANT_NULL_CHECK
-                                        },
-                                        binaryExpr,
-                                        assumptions[secondName]!!
-                                    ) to mapOf()
-                                secondAssumptionType == Assumption.Type.NULL && firstAssumptionType == Assumption.Type.NOT_NULL ->
-                                    Error(
-                                        if (isNotEquals) {
-                                            Error.Type.REDUNDANT_NOT_NULL_CHECK
-                                        } else {
-                                            Error.Type.REDUNDANT_NULL_CHECK
-                                        }, binaryExpr, assumptions[name]!!
-                                    ) to mapOf()
-                                else -> null to mapOf<String, Assumption>()
-                            }
-                            val errorList = if (error != null) listOf(error) else listOf()
-                            errorList to newAssumptions
-                        }
-                        else -> listOf<Error>() to mapOf<String, Assumption>()
+                    leftAssumption.type == Assumption.Type.NOT_NULL && rightAssumption.type == Assumption.Type.NULL -> {
+                        val errorType =
+                            if (isNotEquals) Error.Type.REDUNDANT_NOT_NULL_CHECK else Error.Type.REDUNDANT_NULL_CHECK
+                        Error(errorType, binaryExpr, leftAssumption) to null
                     }
-                    return compareErrors + sideErrors to sideAssumptions + compareAssumptions
-                } else {
-                    return sideErrors to sideAssumptions
+                    leftAssumption.type == Assumption.Type.NULL && rightAssumption.type == Assumption.Type.NOT_NULL -> {
+                        val errorType =
+                            if (isNotEquals) Error.Type.REDUNDANT_NULL_CHECK else Error.Type.REDUNDANT_NOT_NULL_CHECK
+                        Error(errorType, binaryExpr, leftAssumption) to null
+                    }
+                    leftAssumption.type == Assumption.Type.NULLABLE && rightAssumption.type == Assumption.Type.NULLABLE -> null to null
+                    // Transfer assumption if name/fieldexpr
+                    leftAssumption.type in listOf(
+                        Assumption.Type.UNKNOWN,
+                        Assumption.Type.NULLABLE
+                    ) && rightAssumption.type != Assumption.Type.UNKNOWN -> {
+                        // TODO: Field support
+                        if (left.isNameExpr) {
+                            null to (left.asNameExpr().name.asString() to Assumption(
+                                maybeInvertAssumptionType(
+                                    rightAssumption.type,
+                                    isNotEquals
+                                ), rightAssumption.causedBy
+                            ))
+                        } else null to null
+                    }
+                    rightAssumption.type in listOf(
+                        Assumption.Type.UNKNOWN,
+                        Assumption.Type.NULLABLE
+                    ) && leftAssumption.type != Assumption.Type.UNKNOWN -> {
+                        if (right.isNameExpr) {
+                            null to (right.asNameExpr().name.asString() to Assumption(
+                                maybeInvertAssumptionType(
+                                    leftAssumption.type,
+                                    isNotEquals
+                                ), leftAssumption.causedBy
+                            ))
+                        } else null to null
+                    }
+                    else -> null to null
                 }
+                val errors = error?.let { sideErrors + it } ?: sideErrors
+                val newAssumptions = assumptionEntry?.let { assumptions + it } ?: assumptions
+                Assumption(Assumption.Type.UNKNOWN, binaryExpr) to (errors to newAssumptions)
+            }
+            else -> {
+                val (_, leftIR) = analyzeExpression(left, methodMap, assumptions, inversion)
+                val (_, rightIR) = analyzeExpression(right, methodMap, assumptions, inversion)
+                Assumption(Assumption.Type.UNKNOWN, binaryExpr) to ((leftIR.first + rightIR.first) to assumptions)
             }
         }
-        return listOf<Error>() to assumptions
     }
 
     private fun analyze(
@@ -423,17 +368,48 @@ object Analyzer {
         assumptions: Map<String, Assumption>,
         errors: List<Error>
     ): AnalyzeIR {
-        val (conditionErrors, newAssumptions) = analyzeIfCondition(ifStatement.condition, methodMap, assumptions, false)
+        val (_, IR) = analyzeExpression(ifStatement.condition, methodMap, assumptions, false)
+        val (conditionErrors, newAssumptions) = IR
+        val elseAssumptions =
+            newAssumptions
+                .filterNot { (key, value) -> assumptions[key] == value }
+                .filterValues { it.type in listOf(Assumption.Type.NULL, Assumption.Type.NOT_NULL) }
+                .mapValues {
+                    when (it.value.type) {
+                        Assumption.Type.NULL -> Assumption(Assumption.Type.NOT_NULL, it.value.causedBy)
+                        else -> Assumption(Assumption.Type.NULL, it.value.causedBy)
+                    }
+                }
 
         val (ifErrors, _) = analyze(ifStatement.thenStmt, methodMap, newAssumptions, errors + conditionErrors)
 
         val (newErrors, _) =
             if (ifStatement.elseStmt.isPresent) {
-                analyze(ifStatement.elseStmt.get(), methodMap, assumptions, ifErrors)
+                analyze(ifStatement.elseStmt.get(), methodMap, assumptions + elseAssumptions, ifErrors)
             } else {
                 ifErrors to assumptions
             }
         return newErrors to assumptions
+    }
+
+    private fun analyze(
+        switchStatement: SwitchStmt,
+        methodMap: MethodMap,
+        assumptions: Map<String, Assumption>,
+        errors: List<Error>
+    ): AnalyzeIR {
+        val (assumption, _) = analyzeExpression(switchStatement.selector, methodMap, assumptions, false)
+        val newErrors = if (assumption.type == Assumption.Type.NULL) {
+            errors + Error(Error.Type.SWITCH_ON_NULL, switchStatement.selector, assumption)
+        } else {
+            errors
+        }
+
+        return switchStatement.entries.fold(newErrors to assumptions) { (errors, assumptions), entryStatement ->
+            entryStatement.statements.fold(errors to assumptions) { (errors, assumptions), statement ->
+                analyze(statement, methodMap, assumptions, errors)
+            }
+        }
     }
 
     private fun buildMethodMap(cu: CompilationUnit): MethodMap =
@@ -453,16 +429,11 @@ object Analyzer {
     fun analyze(cu: CompilationUnit): List<Error> {
         val methodMap = buildMethodMap(cu)
         return cu.findAll(MethodDeclaration::class.java).fold(listOf()) { acc, method ->
-            println("${method.nameAsString} ${analyze(method, methodMap)}")
             acc + analyze(method, methodMap)
         }
     }
 
-    fun parse(file: File): CompilationUnit {
-//        val parserConfig = ParserConfiguration().setAttributeComments(true)
-//        StaticJavaParser.setConfiguration(parserConfig)
-        return StaticJavaParser.parse(file)!!
-    }
+    fun parse(file: File): CompilationUnit = StaticJavaParser.parse(file)!!
 
     fun parseAndAnalyze(file: File): List<Error> =
         analyze(parse(file))

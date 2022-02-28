@@ -1,9 +1,7 @@
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
-import Analyzer.Assumption
 import Analyzer.Error
-import java.io.File
 import java.nio.file.Path
 import java.nio.file.Paths
 
@@ -97,7 +95,7 @@ internal class AnalyzerTest {
     @Test
     internal fun `Redundant null check with a negated variable check`() {
         assertErrorOnLine(
-            Error.Type.REDUNDANT_NULL_CHECK,
+            Error.Type.REDUNDANT_NOT_NULL_CHECK,
             """void test(@NotNull String test2) {
                     String test = null;
                     //errormark
@@ -109,9 +107,9 @@ internal class AnalyzerTest {
     }
 
     @Test
-    internal fun `Redundant null check with a double negated variable check`() {
+    internal fun `Redundant not null check with a double negated variable check`() {
         assertErrorOnLine(
-            Error.Type.REDUNDANT_NULL_CHECK,
+            Error.Type.REDUNDANT_NOT_NULL_CHECK,
             """void test(@NotNull String test2, boolean bool1) {
                     String test = null;
                     //errormark
@@ -125,7 +123,7 @@ internal class AnalyzerTest {
     @Test
     internal fun `Redundant not-null check with a negated variable check`() {
         assertErrorOnLine(
-            Error.Type.REDUNDANT_NOT_NULL_CHECK,
+            Error.Type.REDUNDANT_NULL_CHECK,
             """void test(@NotNull String test2) {
                     String test = null;
                     //errormark
@@ -257,12 +255,12 @@ internal class AnalyzerTest {
     @Test
     internal fun `Calling a method of a proven null object`() {
         assertErrorOnLine(
-            Error.Type.FUNCTION_CALL_IS_NULL,
+            Error.Type.FIELD_ACCESS_IS_NULL,
             """
                 void test(String test) {
                     if (test == null) {
                         //errormark
-                        int length = test2.length(); 
+                        int length = test.length(); 
                     }
                 }""".trimIndent()
         )
@@ -311,6 +309,81 @@ internal class AnalyzerTest {
             """
                 void test(@Nullable Point test) {
                     if (test != null && test.x == 5) {
+                    }
+                }""".trimIndent()
+        )
+    }
+    @Test
+    fun `Field access may be null error, after comparing nullable to nullable`() {
+        assertErrorOnLine(Error.Type.FIELD_ACCESS_MAY_BE_NULL,
+            """
+                void test(@Nullable Point test, @Nullable Point test2) {
+                    if (test != test2) {
+                        //errormark
+                        int x = test.x;
+                    }
+                }""".trimIndent()
+        )
+    }
+
+    @Test
+    fun `Fields are assumed to be nullable`() {
+        assertErrorOnLine(Error.Type.FUNCTION_CALL_MAY_BE_NULL,
+            """
+                void foo(@NotNull Point test) {
+                }
+                void test(Point test) {
+                    if (test.rightNeighbour != null) {
+                      foo(test.rightNeighbour);
+                    }
+                    //errormark
+                    foo(test.rightNeighbour);
+                }""".trimIndent()
+        )
+    }
+    @Test
+    fun `Else blocks have assumptions flipped`() {
+        assertErrorOnLine(Error.Type.FIELD_ACCESS_IS_NULL,
+            """
+                void test(Point test) {
+                    if (test != null) {
+                    } else {
+                        //errormark
+                        Point test2 = test.rightNeighbour;
+                    }
+                }""".trimIndent()
+        )
+    }
+
+    @Test
+    fun `Switching on null produces an error`() {
+        assertErrorOnLine(Error.Type.SWITCH_ON_NULL,
+            """
+                void test() {
+                    Integer value = null;
+                    //errormark
+                    switch (value) {
+                        default:
+                        throw IllegalArgumentException("wtf");
+                    }
+                }""".trimIndent()
+        )
+    }
+    @Test
+    fun `Errors are detected inside switch statements`() {
+        assertErrorOnLine(Error.Type.REDUNDANT_NULL_CHECK,
+            """
+                void test(@NotNull Point p) {
+                    Integer value = 4;
+                    switch (value) {
+                        case 1:
+                        break; 
+                        default:
+                        //errormark
+                         if (p == null) {
+                           throw IllegalArgumentException("p is null");
+                         }
+                         break;
                     }
                 }""".trimIndent()
         )
